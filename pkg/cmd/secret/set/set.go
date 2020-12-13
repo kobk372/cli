@@ -32,6 +32,8 @@ type SetOptions struct {
 	Body            string
 	Visibility      string
 	RepositoryNames []string
+
+	Wizard bool
 }
 
 func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command {
@@ -53,6 +55,11 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 			$ gh secret set ORG_SECRET --org=anotherOrg --visibility="all"
 `),
 		Args: func(cmd *cobra.Command, args []string) error {
+			if !cmd.Flags().Changed("visibility") && !cmd.Flags().Changed("org") && !cmd.Flags().Changed("body") {
+				opts.Wizard = true
+				return nil
+			}
+
 			if len(args) != 1 {
 				return &cmdutil.FlagError{Err: errors.New("must pass single secret name")}
 			}
@@ -65,8 +72,10 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
 
-			opts.SecretName = args[0]
+			if !opts.Wizard {
+				opts.SecretName = args[0]
 
+<<<<<<< HEAD
 			err := validSecretName(opts.SecretName)
 			if err != nil {
 				return err
@@ -79,10 +88,26 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 				}
 
 				if opts.Visibility != shared.All && opts.Visibility != shared.Private && opts.Visibility != shared.Selected {
-					return &cmdutil.FlagError{Err: errors.New(
-						"--visibility must be one of `all`, `private`, or `selected`")}
+=======
+				if cmd.Flags().Changed("visibility") {
+					if opts.OrgName == "" {
+						return &cmdutil.FlagError{Err: errors.New(
+							"--visibility not supported for repository secrets; did you mean to pass --org?")}
+					}
+
+					if opts.Visibility != shared.VisAll && opts.Visibility != shared.VisPrivate && opts.Visibility != shared.VisSelected {
+						return &cmdutil.FlagError{Err: errors.New(
+							"--visibility must be one of `all`, `private`, or `selected`")}
+					}
 				}
 
+				if cmd.Flags().Changed("repos") && opts.Visibility != shared.VisSelected {
+>>>>>>> 441-secrets-survey
+					return &cmdutil.FlagError{Err: errors.New(
+						"--repos only supported when --visibility='selected'")}
+				}
+
+<<<<<<< HEAD
 				if opts.Visibility != shared.Selected && cmd.Flags().Changed("repos") {
 					return &cmdutil.FlagError{Err: errors.New(
 						"--repos only supported when --visibility='selected'")}
@@ -96,6 +121,12 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 				if cmd.Flags().Changed("repos") {
 					opts.Visibility = shared.Selected
 				}
+=======
+				if opts.Visibility == shared.VisSelected && len(opts.RepositoryNames) == 0 {
+					return &cmdutil.FlagError{Err: errors.New(
+						"--repos flag required when --visibility='selected'")}
+				}
+>>>>>>> 441-secrets-survey
 			}
 
 			if runF != nil {
@@ -114,18 +145,24 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 }
 
 func setRun(opts *SetOptions) error {
-	body, err := getBody(opts)
-	if err != nil {
-		return fmt.Errorf("did not understand secret body: %w", err)
-	}
-
 	c, err := opts.HttpClient()
 	if err != nil {
 		return fmt.Errorf("could not create http client: %w", err)
 	}
 	client := api.NewClientFromHTTP(c)
 
+<<<<<<< HEAD
 	orgName := opts.OrgName
+=======
+	if opts.Wizard {
+		return setWizard(client, opts)
+	}
+
+	body, err := getBody(opts)
+	if err != nil {
+		return fmt.Errorf("did not understand secret body: %w", err)
+	}
+>>>>>>> 441-secrets-survey
 
 	var baseRepo ghrepo.Interface
 	if orgName == "" {
@@ -135,27 +172,126 @@ func setRun(opts *SetOptions) error {
 		}
 	}
 
+<<<<<<< HEAD
 	var pk *PubKey
 	if orgName != "" {
 		pk, err = getOrgPublicKey(client, orgName)
-	} else {
-		pk, err = getRepoPubKey(client, baseRepo)
+=======
+	host := ghinstance.OverridableDefault()
+	if opts.OrgName == "@owner" {
+		opts.OrgName = baseRepo.RepoOwner()
+		host = baseRepo.RepoHost()
 	}
+
+	pk, err := getPubKey(client, baseRepo, host, *opts)
 	if err != nil {
 		return fmt.Errorf("failed to fetch public key: %w", err)
 	}
 
-	eBody, err := box.SealAnonymous(nil, body, &pk.Raw, opts.RandomOverride)
+	encoded, err := encrypt(body, *pk, *opts)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt body: %w", err)
 	}
 
+	if opts.OrgName != "" {
+		var orgRepos []api.OrgRepo
+		if opts.Visibility == shared.VisSelected {
+			orgRepos, err = mapRepoNamesToID(client, host, opts.OrgName, opts.RepositoryNames)
+			if err != nil {
+				return fmt.Errorf("failed to get IDs for repo names: %w", err)
+			}
+		}
+
+		err = putOrgSecret(client, pk, host, encoded, orgRepos, *opts)
+>>>>>>> 441-secrets-survey
+	} else {
+		err = putRepoSecret(client, pk, baseRepo, encoded, *opts)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to set secret: %w", err)
+	}
+
+	return nil
+}
+
+// TODO validate secret name: only letters and _
+// TODO notice update case for orgs, pre-check org visibility list
+
+func setWizard(client *api.Client, opts *SetOptions) error {
+	var err error
+
+	baseRepo, err := opts.BaseRepo()
+	if err != nil {
+		return fmt.Errorf("could not determine base repo: %w", err)
+	}
+
+	secretType, err := promptSecretType()
+	if err != nil {
+		return fmt.Errorf("failed to get secret type: %w", err)
+	}
+
+	var visibility string
+	var orgRepos []api.OrgRepo
+	var orgName string
+	hostname := ghinstance.OverridableDefault()
+	if secretType == orgType {
+		orgName, err = promptOrgName(baseRepo.RepoOwner())
+		if err != nil {
+			return fmt.Errorf("failed to get organization name: %w", err)
+		}
+
+		if orgName == baseRepo.RepoOwner() {
+			hostname = baseRepo.RepoHost()
+		}
+
+		visibility, err = promptVisibility()
+		if err != nil {
+			return fmt.Errorf("failed to get visibility: %w", err)
+		}
+
+		if visibility == shared.VisSelected {
+			orgRepos, err = promptRepositories(client, hostname, orgName)
+			if err != nil {
+				return fmt.Errorf("failed to get repository names: %w", err)
+			}
+		}
+	}
+
+	secretName, err := promptSecretName()
+	if err != nil {
+		return fmt.Errorf("failed to get secret name: %w", err)
+	}
+
+	secretBody, err := promptSecretBody()
+	if err != nil {
+		return fmt.Errorf("failed to get secret body", err)
+	}
+
+	opts.OrgName = orgName
+	opts.SecretName = secretName
+	opts.Visibility = visibility
+
+	pk, err := getPubKey(client, baseRepo, hostname, *opts)
+	if err != nil {
+		return fmt.Errorf("failed to fetch public key: %w", err)
+	}
+
+	encoded, err := encrypt(secretBody, *pk, *opts)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt body: %w", err)
+	}
+
+<<<<<<< HEAD
 	encoded := base64.StdEncoding.EncodeToString(eBody)
 
 	if orgName != "" {
 		err = putOrgSecret(client, pk, *opts, encoded)
+=======
+	if orgName != "" {
+		err = putOrgSecret(client, pk, hostname, encoded, orgRepos, *opts)
+>>>>>>> 441-secrets-survey
 	} else {
-		err = putRepoSecret(client, pk, baseRepo, opts.SecretName, encoded)
+		err = putRepoSecret(client, pk, baseRepo, encoded, *opts)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to set secret: %w", err)
@@ -216,4 +352,28 @@ func getBody(opts *SetOptions) (body []byte, err error) {
 	}
 
 	return []byte(opts.Body), nil
+}
+
+func getPubKey(client *api.Client, baseRepo ghrepo.Interface, host string, opts SetOptions) (pk *PubKey, err error) {
+	if opts.OrgName != "" {
+		pk, err = getOrgPublicKey(client, host, opts.OrgName)
+	} else {
+		pk, err = getRepoPubKey(client, baseRepo)
+	}
+
+	return
+}
+
+func encrypt(body []byte, pk PubKey, opts SetOptions) (string, error) {
+	eBody, err := box.SealAnonymous(nil, body, &pk.Raw, opts.RandomOverride)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(eBody), nil
+}
+
+func setSecret(client *api.Client, pk PubKey, host, encoded string, baseRepo ghrepo.Interface, opts SetOptions) error {
+	// TODO
+	return nil
 }
